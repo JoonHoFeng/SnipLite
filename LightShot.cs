@@ -222,6 +222,8 @@ class CaptureForm : Form {
     string selectionDrag = "";
     Rectangle originalSelection;
     int lineWidth = 3;
+    int textSize = 22;
+    Font textFont;
     Point markOffset = Point.Empty, originalOffset;
     Dictionary<string, Color> toolColors = new Dictionary<string, Color>();
     Dictionary<string, int> toolWidths = new Dictionary<string, int>();
@@ -229,6 +231,8 @@ class CaptureForm : Form {
     MoreColorButton moreColor;
     List<ColorChip> colorChips = new List<ColorChip>();
     List<WidthChip> widthChips = new List<WidthChip>();
+    List<TextSizeChip> textChips = new List<TextSizeChip>();
+    FlowLayoutPanel styleGroup;
     List<Action<Graphics>> marks = new List<Action<Graphics>>();
     List<Point> stroke;
     FlowLayoutPanel bar;
@@ -243,9 +247,11 @@ class CaptureForm : Form {
         toolColors["矩形"] = Color.Red;
         toolColors["箭头"] = Color.Red;
         toolColors["画笔"] = Color.Red;
+        toolColors["文字"] = Color.Red;
         toolWidths["矩形"] = 3;
         toolWidths["箭头"] = 3;
         toolWidths["画笔"] = 3;
+        toolWidths["文字"] = 22;
         bounds = SystemInformation.VirtualScreen;
         screen = new Bitmap(bounds.Width, bounds.Height);
         using (Graphics g = Graphics.FromImage(screen)) g.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size);
@@ -297,7 +303,7 @@ class CaptureForm : Form {
         options.Margin = Padding.Empty;
         options.Visible = false;
         FlowLayoutPanel colorGroup = MakeGroup("颜色", false);
-        FlowLayoutPanel widthGroup = MakeGroup("线宽", true);
+        styleGroup = MakeGroup("线宽", true);
         Color[] palette = new Color[] { Color.Red, Color.Orange, Color.Yellow, Color.LimeGreen, Color.DeepSkyBlue, Color.White, Color.Black };
         string[] paletteNames = new string[] { "红色", "橙色", "黄色", "绿色", "蓝色", "白色", "黑色" };
         for (int i = 0; i < palette.Length; i++) {
@@ -308,6 +314,7 @@ class CaptureForm : Form {
                 if (toolColors.ContainsKey(tool)) toolColors[tool] = chosen;
                 SaveStyles();
                 UpdateOptions();
+                ApplyTextStyle();
             };
             colorChips.Add(chip);
             colorGroup.Controls.Add(chip);
@@ -323,6 +330,7 @@ class CaptureForm : Form {
                     if (toolColors.ContainsKey(tool)) toolColors[tool] = color;
                     SaveStyles();
                     UpdateOptions();
+                    ApplyTextStyle();
                 }
             }
         };
@@ -338,10 +346,25 @@ class CaptureForm : Form {
                 UpdateOptions();
             };
             widthChips.Add(line);
-            widthGroup.Controls.Add(line);
+            styleGroup.Controls.Add(line);
+        }
+        int[] sizes = new int[] { 14, 22, 32 };
+        for (int i = 0; i < sizes.Length; i++) {
+            int chosenSize = sizes[i];
+            TextSizeChip sample = new TextSizeChip(chosenSize);
+            sample.Visible = false;
+            sample.Click += delegate {
+                textSize = chosenSize;
+                toolWidths["文字"] = chosenSize;
+                SaveStyles();
+                UpdateOptions();
+                ApplyTextStyle();
+            };
+            textChips.Add(sample);
+            styleGroup.Controls.Add(sample);
         }
         options.Controls.Add(colorGroup);
-        options.Controls.Add(widthGroup);
+        options.Controls.Add(styleGroup);
         Controls.Add(options);
         LoadStyles();
         RefreshToolButtons();
@@ -426,31 +449,19 @@ class CaptureForm : Form {
             if (text != null) { text.Focus(); return; }
             text = new TextBox();
             text.Location = e.Location;
-            text.Width = 180;
+            text.BorderStyle = BorderStyle.FixedSingle;
             text.AccessibleName = "输入文字，Enter 确认，Escape 取消";
-            Controls.Add(text);
-            text.BringToFront();
-            text.Focus();
+            text.TextChanged += delegate { ResizeTextBox(); };
             text.KeyDown += delegate(object s, KeyEventArgs k) {
-                if (k.KeyCode == Keys.Escape) {
-                    Controls.Remove(text);
-                    text.Dispose();
-                    text = null;
-                    k.SuppressKeyPress = true;
-                    return;
-                }
-                if (k.KeyCode == Keys.Enter) {
-                    string value = text.Text;
-                    Point p = new Point(text.Left - markOffset.X, text.Top - markOffset.Y);
-                    Color c = color;
-                    if (value.Length > 0) marks.Add(delegate(Graphics g) { using (SolidBrush brush = new SolidBrush(c)) g.DrawString(value, Font, brush, p); });
-                    Controls.Remove(text);
-                    text.Dispose();
-                    text = null;
-                    Invalidate();
-                    k.SuppressKeyPress = true;
-                }
+                if (k.KeyCode == Keys.Escape) { k.SuppressKeyPress = true; CloseText(false); return; }
+                if (k.KeyCode == Keys.Enter) { k.SuppressKeyPress = true; CloseText(true); }
             };
+            Controls.Add(text);
+            ApplyTextStyle();
+            text.BringToFront();
+            bar.BringToFront();
+            options.BringToFront();
+            text.Focus();
             return;
         }
         start = e.Location;
@@ -460,14 +471,11 @@ class CaptureForm : Form {
         if (tool == "" && selection.Width > 2 && selection.Height > 2) {
             originalSelection = selection;
             originalOffset = markOffset;
-            foreach (Point pt in Handles()) {
-                if (Math.Abs(pt.X - e.X) <= 7 && Math.Abs(pt.Y - e.Y) <= 7) {
-                    selectionDrag = (pt.Y == selection.Top ? "t" : pt.Y == selection.Bottom ? "b" : "") + (pt.X == selection.Left ? "l" : pt.X == selection.Right ? "r" : "");
-                    break;
-                }
+            selectionDrag = HitSelection(e.Location);
+            if (selectionDrag != "") {
+                Cursor = CursorFor(selectionDrag);
+                return;
             }
-            if (selectionDrag == "" && selection.Contains(e.Location)) selectionDrag = "move";
-            if (selectionDrag != "") return;
         }
         if (tool == "画笔") {
             stroke = new List<Point>();
@@ -484,6 +492,7 @@ class CaptureForm : Form {
     protected override void OnMouseMove(MouseEventArgs e) {
         base.OnMouseMove(e);
         if (!dragging) {
+            UpdateSelectionCursor(e.Location);
             if (selection.Width == 0 || selection.Height == 0) {
                 Screen now = Screen.FromPoint(Cursor.Position);
                 if (coachScreen == null || now.DeviceName != coachScreen.DeviceName) {
@@ -543,6 +552,7 @@ class CaptureForm : Form {
             marks.Add(delegate(Graphics g) { using (Pen p = new Pen(markColor, markWidth)) g.DrawLines(p, pts); });
         }
         if (selection.Width > 2 && selection.Height > 2) PlaceChrome();
+        UpdateSelectionCursor(e.Location);
         Invalidate();
     }
 
@@ -608,6 +618,8 @@ class CaptureForm : Form {
         bool show = toolColors.ContainsKey(tool);
         options.Visible = show && bar.Visible;
         if (!show) return;
+        bool letters = tool == "文字";
+        if (styleGroup != null) styleGroup.AccessibleName = letters ? "字号" : "线宽";
         bool preset = false;
         foreach (ColorChip chip in colorChips) {
             Color swatch = chip.Swatch;
@@ -617,8 +629,15 @@ class CaptureForm : Form {
             chip.Invalidate();
         }
         foreach (WidthChip chip in widthChips) {
+            chip.Visible = !letters;
             chip.Selected = chip.WidthPx == lineWidth;
             chip.AccessibleName = (chip.Selected ? "已选择，" : "") + "线宽 " + chip.WidthPx + " 像素";
+            chip.Invalidate();
+        }
+        foreach (TextSizeChip chip in textChips) {
+            chip.Visible = letters;
+            chip.Selected = chip.PointSize == textSize;
+            chip.AccessibleName = (chip.Selected ? "已选择，" : "") + "字号 " + chip.PointSize;
             chip.Invalidate();
         }
         moreColor.Current = color;
@@ -640,6 +659,7 @@ class CaptureForm : Form {
             }
         }
         UpdateOptions();
+        if (IsHandleCreated) UpdateSelectionCursor(PointToClient(Cursor.Position));
     }
 
     Point[] Handles() {
@@ -660,6 +680,9 @@ class CaptureForm : Form {
                 int w = (int)r.GetValue(t + "Width", 3);
                 toolWidths[t] = (w == 3 || w == 6 || w == 10) ? w : 3;
             }
+            toolColors["文字"] = Color.FromArgb((int)r.GetValue("文字Color", Color.Red.ToArgb()));
+            int savedSize = (int)r.GetValue("文字Width", 22);
+            toolWidths["文字"] = (savedSize == 14 || savedSize == 22 || savedSize == 32) ? savedSize : 22;
         }
     }
 
@@ -697,6 +720,87 @@ class CaptureForm : Form {
         return b;
     }
 
+    void CloseText(bool commit) {
+        if (text == null) return;
+        if (commit && text.Text.Length > 0) {
+            string value = text.Text;
+            Point p = new Point(text.Left - markOffset.X, text.Top - markOffset.Y);
+            Color c = color;
+            float emPx = textSize;
+            using (Graphics tg = text.CreateGraphics()) emPx = text.Font.SizeInPoints * tg.DpiY / 72f;
+            marks.Add(delegate(Graphics g) {
+                TextRenderingHint hint = g.TextRenderingHint;
+                g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                using (Font f = new Font("Microsoft YaHei UI", emPx, FontStyle.Regular, GraphicsUnit.Pixel))
+                using (SolidBrush brush = new SolidBrush(c)) g.DrawString(value, f, brush, p);
+                g.TextRenderingHint = hint;
+            });
+        }
+        text.Font = uiFont;
+        Controls.Remove(text);
+        text.Dispose();
+        text = null;
+        if (textFont != null) { textFont.Dispose(); textFont = null; }
+        Invalidate();
+    }
+
+    void ApplyTextStyle() {
+        if (text == null) return;
+        Font next = new Font("Microsoft YaHei UI", textSize, FontStyle.Regular, GraphicsUnit.Point);
+        text.Font = next;
+        text.ForeColor = color;
+        float lum = (0.299f * color.R + 0.587f * color.G + 0.114f * color.B) / 255f;
+        text.BackColor = lum > 0.62f ? Color.FromArgb(32, 38, 50) : Color.White;
+        Font previous = textFont;
+        textFont = next;
+        if (previous != null) previous.Dispose();
+        ResizeTextBox();
+    }
+
+    void ResizeTextBox() {
+        if (text == null) return;
+        string sample = text.Text.Length == 0 ? "文字" : text.Text;
+        int minW = TextRenderer.MeasureText("文字", text.Font).Width + 12;
+        int wanted = TextRenderer.MeasureText(sample, text.Font).Width + 16;
+        int maxW = Math.Max(minW, ClientSize.Width - text.Left - 8);
+        text.Width = Math.Max(minW, Math.Min(maxW, wanted));
+    }
+
+    string HitSelection(Point p) {
+        if (selection.Width <= 2 || selection.Height <= 2) return "";
+        int band = 6;
+        bool nearL = Math.Abs(p.X - selection.Left) <= band && p.Y >= selection.Top - band && p.Y <= selection.Bottom + band;
+        bool nearR = Math.Abs(p.X - selection.Right) <= band && p.Y >= selection.Top - band && p.Y <= selection.Bottom + band;
+        bool nearT = Math.Abs(p.Y - selection.Top) <= band && p.X >= selection.Left - band && p.X <= selection.Right + band;
+        bool nearB = Math.Abs(p.Y - selection.Bottom) <= band && p.X >= selection.Left - band && p.X <= selection.Right + band;
+        if ((nearL || nearR) && (nearT || nearB)) return (nearT ? "t" : "b") + (nearL ? "l" : "r");
+        if (nearT) return "t";
+        if (nearB) return "b";
+        if (nearL) return "l";
+        if (nearR) return "r";
+        if (selection.Contains(p)) return "move";
+        return "";
+    }
+
+    Cursor CursorFor(string hit) {
+        if (hit == "move") return Cursors.SizeAll;
+        bool left = hit.IndexOf('l') >= 0;
+        bool right = hit.IndexOf('r') >= 0;
+        bool top = hit.IndexOf('t') >= 0;
+        bool bottom = hit.IndexOf('b') >= 0;
+        if ((top && left) || (bottom && right)) return Cursors.SizeNWSE;
+        if ((top && right) || (bottom && left)) return Cursors.SizeNESW;
+        if (top || bottom) return Cursors.SizeNS;
+        if (left || right) return Cursors.SizeWE;
+        return Cursors.Cross;
+    }
+
+    void UpdateSelectionCursor(Point p) {
+        if (text != null) return;
+        if (tool != "" || selection.Width <= 2 || selection.Height <= 2) Cursor = Cursors.Cross;
+        else Cursor = CursorFor(HitSelection(p));
+    }
+
     void Command(string s) {
         if (s == "选区") { tool = ""; return; }
         if (s == "取消") { Close(); return; }
@@ -708,10 +812,10 @@ class CaptureForm : Form {
         if (s == "撤销") { Undo(); return; }
         if (s == "矩形" || s == "箭头" || s == "画笔" || s == "文字") {
             tool = s;
-            if (toolColors.ContainsKey(s)) {
-                color = toolColors[s];
-                lineWidth = toolWidths[s];
-            }
+            if (toolColors.ContainsKey(s)) color = toolColors[s];
+            if (s == "文字") textSize = toolWidths["文字"];
+            else if (toolWidths.ContainsKey(s)) lineWidth = toolWidths[s];
+            ApplyTextStyle();
             return;
         }
         using (Bitmap b = Result()) {
@@ -726,6 +830,7 @@ class CaptureForm : Form {
             uiFont.Dispose();
             coachTitleFont.Dispose();
             coachSubFont.Dispose();
+            if (textFont != null) textFont.Dispose();
         }
     }
 }
@@ -1020,6 +1125,33 @@ class WidthChip : Control {
             int y = Height / 2;
             g.DrawLine(pen, 10, y, Width - 10, y);
         }
+    }
+}
+
+class TextSizeChip : Control {
+    public int PointSize;
+    public bool Selected;
+    bool hover;
+    public TextSizeChip(int pointSize) {
+        PointSize = pointSize;
+        Size = new Size(40, 30);
+        Margin = new Padding(2);
+        Cursor = Cursors.Hand;
+        BackColor = Ui.Group;
+        AccessibleName = "字号 " + pointSize;
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+    }
+    protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnPaint(PaintEventArgs e) {
+        Graphics g = e.Graphics;
+        g.Clear(Selected ? Ui.Active : (hover ? Ui.Hover : BackColor));
+        if (Selected) {
+            using (Pen border = new Pen(Color.DeepSkyBlue, 2)) g.DrawRectangle(border, 1, 1, Width - 3, Height - 3);
+        }
+        float sample = PointSize <= 14 ? 8f : (PointSize <= 22 ? 12f : 16f);
+        using (Font font = new Font("Microsoft YaHei UI", sample, FontStyle.Regular, GraphicsUnit.Point))
+            TextRenderer.DrawText(g, "文", font, ClientRectangle, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
     }
 }
 
